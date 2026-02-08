@@ -1,0 +1,25 @@
+# Browser session data (can be 100MB+)
+# browser_profile/
+recordings/
+browser_bin/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+uv.lock
+
+# Note: .env is NOT excluded here because Cartesia deploy needs it
+# for API keys (ANTHROPIC_API_KEY, etc.). Cartesia's default behavior
+# is to include .env in deployments.
+
+# Cartesia
+.cartesia/
+
+# Output
+output_music/
+song-generated/
+
+# Misc
+*.pdf
+*.log

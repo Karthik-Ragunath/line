@@ -1,0 +1,16 @@
+[project]
+name = "background-browser-use-agent"
+version = "0.1.0"
+description = "Personal voice assistant with supervisor reasoning and LinkedIn job automation"
+requires-python = ">=3.10"
+dependencies = [
+    "cartesia-line==0.2.2",
+    "browser-use>=0.11.0",
+    "anthropic>=0.70.0",
+    "exa-py>=2.0.0",
+    "playwright>=1.40.0",
+    "httpx>=0.27.0",
+]
+
+[tool.setuptools]
+py-modules = ["main", "browser_automation"]
