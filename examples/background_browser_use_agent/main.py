@@ -394,7 +394,8 @@ class BrowserSupervisorAgent(AgentClass):
                 c if c.isalnum() or c in " _-" else "" for c in caption[:40]
             ).strip().replace(" ", "_") or "song"
             filename = f"{timestamp}_{safe_caption}.flac"
-            filepath = _SONG_OUTPUT_DIR / filename
+            # filepath = _SONG_OUTPUT_DIR / filename
+            filepath = _SONG_OUTPUT_DIR / "generated.flac"
 
             filepath.write_bytes(response.content)
 

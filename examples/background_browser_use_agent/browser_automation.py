@@ -98,6 +98,14 @@ PROXY_SERVER = os.getenv("PROXY_SERVER", "")       # e.g. "http://proxy:8080" or
 PROXY_USERNAME = os.getenv("PROXY_USERNAME", "")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
 
+# Increase browser-use startup timeouts (default 30s is too short on
+# headless servers with heavy Chrome profiles)
+os.environ.setdefault("TIMEOUT_BrowserStartEvent", "120")
+os.environ.setdefault("TIMEOUT_BrowserLaunchEvent", "120")
+# Also increase the internal CDP connection timeout (hardcoded to 30s in
+# local_browser_watchdog.py — we patched it to read this env var)
+os.environ.setdefault("BROWSER_CDP_TIMEOUT", "90")
+
 # ============================================================================
 # STEALTH BROWSER PROFILE (CLOUDFLARE BYPASS)
 # ============================================================================
@@ -110,23 +118,14 @@ STEALTH_USER_AGENT = (
 )
 
 # Extra Chromium args for stealth / anti-bot evasion
+# NOTE: browser-use defaults already include --disable-blink-features=AutomationControlled
+# and many anti-fingerprint flags. We only add args that aren't already present.
 STEALTH_CHROME_ARGS: list[str] = [
-    # --- Core anti-detection ---
-    "--disable-blink-features=AutomationControlled",
     # Prevent WebRTC from leaking real IPs (important when behind proxy)
     "--webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--force-webrtc-ip-handling-policy",
-    # Disable automation-related UI cues
-    "--disable-infobars",
-    "--disable-notifications",
+    # Suppress automation UI cues
     "--disable-session-crashed-bubble",
-    "--disable-save-password-bubble",
-    # Reduce fingerprint surface
-    "--disable-reading-from-canvas",
-    "--disable-remote-fonts",
-    # Appear like a normal user window
-    "--window-size=1920,1080",
-    "--start-maximized",
 ]
 
 
@@ -179,10 +178,12 @@ def build_stealth_browser_profile(
         args=STEALTH_CHROME_ARGS,
         disable_security=True,
 
-        # --- Extensions (ad-block, cookie-consent, ClearURLs) ---
-        # These help pass Cloudflare because they remove tracking JS that
-        # otherwise alters the fingerprint, and auto-dismiss cookie banners
-        enable_default_extensions=True,
+        # --- Extensions ---
+        # Disabled for headless servers: extensions add ~20-30s to browser
+        # startup (download + load 4 CRX files) which exceeds the 30s CDP
+        # timeout in browser-use's LocalBrowserWatchdog.
+        # The anti-detection Chrome args + UA are sufficient without them.
+        enable_default_extensions=False,
 
         # --- Human-like timing ---
         # Slower actions reduce bot-like rapid-fire interaction patterns
@@ -703,14 +704,17 @@ async def execute_browser_action(
     
     browser = Browser(browser_profile=profile)
     
-    # Start the browser session so we can inject stealth JS via CDP
-    # before the agent begins interacting with pages.
-    await browser.start()
-    try:
-        await browser._cdp_add_init_script(STEALTH_JS_PAYLOAD)
-        print("🛡️  Stealth JS injected (webdriver mask, plugins spoof, permissions spoof)")
-    except Exception as e:
-        print(f"⚠️  Could not inject stealth JS (non-fatal): {e}")
+    # NOTE: We do NOT call browser.start() explicitly here.
+    # The Agent.run() method starts the browser internally with its own
+    # timeout management.  Calling start() ourselves hits the bubus
+    # EventBus 30s default timeout when extensions are downloaded for
+    # the first time, causing a spurious TimeoutError.
+    #
+    # The critical anti-detection measures are already applied via:
+    #   - Chrome args (--disable-blink-features=AutomationControlled)
+    #   - Realistic User-Agent header
+    #   - Human-like timing (wait_between_actions, page-load waits)
+    #   - Session persistence (user_data_dir with cookies)
     
     # Create LLM for the agent using browser-use's ChatAnthropic
     llm = BrowserChatAnthropic(
@@ -809,45 +813,68 @@ def list_chrome_profiles():
 
 
 def ensure_chrome_closed():
-    """Ensure Chrome is completely closed before running browser automation."""
+    """Ensure Chrome is completely closed before running browser automation.
+
+    Detects both "Google Chrome" (macOS) and the Playwright-managed
+    Chromium binary that browser-use launches (which appears as plain
+    ``chrome`` in the process list with ``--user-data-dir=…browser_profile``).
+    """
     import subprocess
     import time
-    
+
     print("🔍 Checking if Chrome is running...")
-    
-    # Check if Chrome processes exist
+
+    # Patterns that match any Chrome/Chromium using our profile directory
+    profile_pattern = "chrome.*browser_profile"
+    generic_patterns = [profile_pattern, "Google Chrome"]
+
+    found = False
     try:
-        result = subprocess.run(['pgrep', '-f', 'Google Chrome'], capture_output=True)
-        if result.returncode == 0:
-            print("⚠️ Chrome is currently running. Attempting to close it...")
-            print("   This is necessary to avoid profile conflicts...")
-            
-            # Try graceful close first
-            subprocess.run(['pkill', '-f', 'Google Chrome'], timeout=10)
-            time.sleep(3)
-            
-            # Check if still running
-            result = subprocess.run(['pgrep', '-f', 'Google Chrome'], capture_output=True)
-            if result.returncode == 0:
-                print("💥 Force closing Chrome...")
-                subprocess.run(['pkill', '-9', '-f', 'Google Chrome'], timeout=10)
-                time.sleep(2)
-            
+        for pat in generic_patterns:
+            result = subprocess.run(
+                ["pgrep", "-f", pat], capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                found = True
+                pids = result.stdout.strip().split("\n")
+                print(
+                    f"⚠️ Found {len(pids)} Chrome process(es) matching '{pat}'. "
+                    "Closing to avoid profile lock conflicts..."
+                )
+
+                # Graceful SIGTERM first
+                subprocess.run(["pkill", "-f", pat], timeout=10)
+                time.sleep(3)
+
+                # Check if still alive → force kill
+                result2 = subprocess.run(
+                    ["pgrep", "-f", pat], capture_output=True, text=True
+                )
+                if result2.returncode == 0 and result2.stdout.strip():
+                    print("💥 Force closing Chrome...")
+                    subprocess.run(["pkill", "-9", "-f", pat], timeout=10)
+                    time.sleep(2)
+
+        # Always remove stale singleton artifacts regardless
+        removed_any = False
+        for singleton_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            singleton_file = BROWSER_PROFILE_DIR / singleton_name
+            if singleton_file.exists() or singleton_file.is_symlink():
+                try:
+                    singleton_file.unlink(missing_ok=True)
+                    removed_any = True
+                except OSError:
+                    pass
+        if removed_any:
+            print("🧹 Removed browser profile singleton files")
+
+        if found:
             print("✅ Chrome has been closed successfully")
         else:
             print("✅ Chrome is not running - ready to start with profile")
     except Exception as e:
         print(f"⚠️ Could not check Chrome status: {e}")
-    
-    # Clean up any lock files in custom profile directory
-    try:
-        lock_file = BROWSER_PROFILE_DIR / "SingletonLock"
-        if lock_file.exists() or lock_file.is_symlink():
-            lock_file.unlink(missing_ok=True)
-            print("🧹 Removed browser profile lock file")
-    except Exception as e:
-        print(f"⚠️ Could not clean lock file: {e}")
-    
+
     print("✅ Chrome profile preparation complete")
 
 
@@ -1667,6 +1694,13 @@ Examples:
     )
     
     args = parser.parse_args()
+
+    # On headless Linux servers, interactive users often forget --headless.
+    # If there is no display, force headless to avoid Chrome startup failure:
+    # "Missing X server or $DISPLAY".
+    if not args.headless and os.name != "nt" and not os.environ.get("DISPLAY"):
+        print("⚠️ No DISPLAY detected; forcing headless mode.")
+        args.headless = True
     
     # List profiles and exit if requested
     if args.list_profiles:
