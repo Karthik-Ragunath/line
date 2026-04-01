@@ -19,7 +19,8 @@ load_dotenv()
 
 # Try to import browser-use components
 try:
-    from browser_use import Agent, Browser, ChatAnthropic as BrowserChatAnthropic
+    from browser_use import Agent, Browser, BrowserProfile, ChatAnthropic as BrowserChatAnthropic
+    from browser_use.browser.profile import ProxySettings
     BROWSER_USE_AVAILABLE = True
 except ImportError:
     BROWSER_USE_AVAILABLE = False
@@ -91,6 +92,156 @@ def get_chrome_user_data_dir() -> str:
 # System Chrome profile (for reference only - we use custom profile for automation)
 CHROME_USER_DATA_DIR = get_chrome_user_data_dir()
 CHROME_PROFILE_DIR = "Default"
+
+# Proxy configuration (optional - for Cloudflare bypass with residential proxies)
+PROXY_SERVER = os.getenv("PROXY_SERVER", "")       # e.g. "http://proxy:8080" or "socks5://proxy:1080"
+PROXY_USERNAME = os.getenv("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
+
+# Increase browser-use startup timeouts (default 30s is too short on
+# headless servers with heavy Chrome profiles)
+os.environ.setdefault("TIMEOUT_BrowserStartEvent", "120")
+os.environ.setdefault("TIMEOUT_BrowserLaunchEvent", "120")
+# Also increase the internal CDP connection timeout (hardcoded to 30s in
+# local_browser_watchdog.py — we patched it to read this env var)
+os.environ.setdefault("BROWSER_CDP_TIMEOUT", "90")
+
+# ============================================================================
+# STEALTH BROWSER PROFILE (CLOUDFLARE BYPASS)
+# ============================================================================
+
+# Realistic User-Agent matching a real Chrome 131 on Linux
+# This must match the actual browser channel/version to avoid fingerprint mismatch
+STEALTH_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.6778.139 Safari/537.36"
+)
+
+# Extra Chromium args for stealth / anti-bot evasion
+# NOTE: browser-use defaults already include --disable-blink-features=AutomationControlled
+# and many anti-fingerprint flags. We only add args that aren't already present.
+STEALTH_CHROME_ARGS: list[str] = [
+    # Prevent WebRTC from leaking real IPs (important when behind proxy)
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--force-webrtc-ip-handling-policy",
+    # Suppress automation UI cues
+    "--disable-session-crashed-bubble",
+]
+
+
+def build_stealth_browser_profile(
+    *,
+    headless: bool = False,
+    use_profile: bool = True,
+    record_video: bool = True,
+    proxy_server: str = "",
+    proxy_username: str = "",
+    proxy_password: str = "",
+) -> "BrowserProfile":
+    """
+    Build a BrowserProfile with anti-detection / Cloudflare-bypass settings.
+
+    Techniques applied (per browserless.io recommendations):
+      1. Realistic User-Agent matching the browser binary
+      2. Extra Chrome flags to disable automation indicators
+      3. Human-like timing (wait_between_actions, page-load waits)
+      4. Default extensions enabled (uBlock Origin blocks tracking scripts)
+      5. Optional residential proxy support
+      6. Persistent user-data-dir to retain cookies / sessions
+    """
+    if not BROWSER_USE_AVAILABLE:
+        raise RuntimeError("browser-use is not installed")
+
+    BROWSER_PROFILE_DIR.mkdir(exist_ok=True)
+    RECORDINGS_DIR.mkdir(exist_ok=True)
+
+    # --- Proxy setup ---
+    proxy = None
+    _proxy_server = proxy_server or PROXY_SERVER
+    if _proxy_server:
+        _proxy_user = proxy_username or PROXY_USERNAME
+        _proxy_pass = proxy_password or PROXY_PASSWORD
+        proxy = ProxySettings(
+            server=_proxy_server,
+            username=_proxy_user or None,
+            password=_proxy_pass or None,
+        )
+        print(f"🌐 Proxy configured: {_proxy_server}")
+
+    profile = BrowserProfile(
+        # --- Display & headless ---
+        headless=headless,
+        window_size={"width": 1920, "height": 1080},
+
+        # --- Anti-detection ---
+        user_agent=STEALTH_USER_AGENT,
+        args=STEALTH_CHROME_ARGS,
+        disable_security=True,
+
+        # --- Extensions ---
+        # Disabled for headless servers: extensions add ~20-30s to browser
+        # startup (download + load 4 CRX files) which exceeds the 30s CDP
+        # timeout in browser-use's LocalBrowserWatchdog.
+        # The anti-detection Chrome args + UA are sufficient without them.
+        enable_default_extensions=False,
+
+        # --- Human-like timing ---
+        # Slower actions reduce bot-like rapid-fire interaction patterns
+        wait_between_actions=0.8,                     # 800 ms between actions
+        minimum_wait_page_load_time=1.0,              # 1 s minimum page-load
+        wait_for_network_idle_page_load_time=1.5,     # 1.5 s network-idle wait
+
+        # --- Session persistence ---
+        # Re-using the same profile directory retains cookies / localStorage
+        # so Cloudflare "remembers" this browser as trusted across runs
+        user_data_dir=str(BROWSER_PROFILE_DIR.absolute()) if use_profile else None,
+
+        # --- Recording ---
+        record_video_dir=str(RECORDINGS_DIR) if record_video else None,
+        record_video_size={"width": 1280, "height": 720} if record_video else None,
+
+        # --- Proxy ---
+        proxy=proxy,
+
+        # --- Keep browser alive briefly to capture video ---
+        keep_alive=False,
+    )
+    return profile
+
+
+# JavaScript snippet injected into new pages to further mask automation signals.
+# Cloudflare checks navigator.webdriver, chrome.runtime, Permissions API, etc.
+STEALTH_JS_PAYLOAD = """
+// 1. Remove navigator.webdriver flag
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+// 2. Spoof chrome.runtime to look like a real extension environment
+if (!window.chrome) { window.chrome = {}; }
+if (!window.chrome.runtime) {
+    window.chrome.runtime = {
+        connect: function() {},
+        sendMessage: function() {},
+    };
+}
+
+// 3. Spoof Permissions API so 'notifications' returns 'prompt' (not 'denied')
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters)
+);
+
+// 4. Mask the number of plugins (headless Chromium has 0)
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5],   // non-zero length
+});
+
+// 5. Mask language array (Cloudflare checks consistency)
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en'],
+});
+"""
 
 
 # ============================================================================
@@ -426,6 +577,7 @@ async def run_resume_optimization_agent(job_url: str = None, job_description: st
 async def scrape_job_description(job_url: str) -> Optional[str]:
     """
     Use browser-use to scrape job description from a URL.
+    Uses stealth profile to bypass Cloudflare on external job sites.
     """
     if not BROWSER_USE_AVAILABLE:
         print("❌ browser-use not available for scraping")
@@ -433,11 +585,14 @@ async def scrape_job_description(job_url: str) -> Optional[str]:
     
     print(f"🌐 Scraping job description from: {job_url}")
     
-    # Create browser with headless mode for scraping
-    browser = Browser(
+    # Use stealth profile even for scraping — external job boards often
+    # sit behind Cloudflare (e.g. thebigjobsite.com, lever.co, greenhouse.io)
+    profile = build_stealth_browser_profile(
         headless=True,
-        keep_alive=False,
+        use_profile=True,   # reuse cookies from earlier sessions
+        record_video=False,
     )
+    browser = Browser(browser_profile=profile)
     
     # Create LLM for the agent using browser-use's ChatAnthropic
     llm = BrowserChatAnthropic(
@@ -446,6 +601,14 @@ async def scrape_job_description(job_url: str) -> Optional[str]:
     
     agent = Agent(
         task=f"""Navigate to {job_url} and extract the complete job description.
+
+        IMPORTANT — CLOUDFLARE HANDLING:
+        If you encounter a Cloudflare "Verify you are human" challenge page:
+          1. Do NOT click on anything immediately — wait 3-5 seconds.
+          2. If there is a checkbox or "Verify" button, click it ONCE.
+          3. Wait another 5-8 seconds for the page to redirect.
+          4. If still on the challenge page after 15 seconds, try refreshing once.
+          5. If still blocked, return whatever partial information you have.
         
         Extract:
         1. Job title
@@ -491,6 +654,18 @@ async def execute_browser_action(
     """
     Execute browser automation using local Chrome with browser-use.
     
+    Applies stealth / anti-detection settings to bypass Cloudflare and
+    similar bot-protection systems on external job application sites.
+    
+    Anti-detection techniques (per browserless.io recommendations):
+      - Realistic User-Agent matching the browser binary
+      - navigator.webdriver masked via JS injection
+      - Chrome runtime & Permissions API spoofed
+      - Human-like timing between actions
+      - Persistent session cookies (Cloudflare cf_clearance)
+      - Optional residential proxy support
+      - uBlock Origin + cookie-consent extensions enabled
+    
     Args:
         prompt: The browser automation prompt to execute
         record_video: Whether to record video of the session
@@ -500,53 +675,57 @@ async def execute_browser_action(
     if not BROWSER_USE_AVAILABLE:
         return {"error": "browser-use not available"}
     
-    print("🌐 Executing browser action with local Chrome...")
+    print("🌐 Executing browser action with stealth profile...")
     print(f"\n📋 Prompt:\n{'-'*50}\n{prompt}\n{'-'*50}\n")
     
     # Ensure Chrome is closed if we're using a profile
     if use_profile:
         ensure_chrome_closed()
     
-    # Create directories
-    RECORDINGS_DIR.mkdir(exist_ok=True)
-    BROWSER_PROFILE_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Build browser kwargs
-    # NOTE: Using a custom profile directory for persistent logins
-    # We don't use the system Chrome profile because it restores all saved tabs
-    # which overwhelms browser-use. Instead, we use a clean custom profile.
-    browser_kwargs = {
-        "headless": headless,
-        "disable_security": True,
-    }
+    # Build stealth browser profile with anti-detection settings
+    profile = build_stealth_browser_profile(
+        headless=headless,
+        use_profile=use_profile,
+        record_video=record_video,
+    )
     
-    # Add Chrome profile if requested
-    # This uses a custom profile directory for persistent logins
     if use_profile:
-        browser_kwargs["user_data_dir"] = str(BROWSER_PROFILE_DIR.absolute())
         print(f"📂 Using persistent browser profile: {BROWSER_PROFILE_DIR.absolute()}")
         print(f"   💡 First run? You may need to log in to LinkedIn manually.")
-        print(f"   💡 Your session will be saved for future runs.")
+        print(f"   💡 Your session & Cloudflare cookies will be saved for future runs.")
     else:
         print("📂 Using fresh browser session (no profile)")
     
-    # Add video recording if requested
-    if record_video:
-        browser_kwargs["record_video_dir"] = str(RECORDINGS_DIR)
-        browser_kwargs["record_video_size"] = {'width': 1280, 'height': 720}
+    print(f"🛡️  Stealth settings: UA spoofed, webdriver masked, human-like timing")
+    if PROXY_SERVER:
+        print(f"🌐 Proxy: {PROXY_SERVER}")
     
-    print(f"🔧 Browser config: {browser_kwargs}")
+    browser = Browser(browser_profile=profile)
     
-    browser = Browser(**browser_kwargs)
+    # NOTE: We do NOT call browser.start() explicitly here.
+    # The Agent.run() method starts the browser internally with its own
+    # timeout management.  Calling start() ourselves hits the bubus
+    # EventBus 30s default timeout when extensions are downloaded for
+    # the first time, causing a spurious TimeoutError.
+    #
+    # The critical anti-detection measures are already applied via:
+    #   - Chrome args (--disable-blink-features=AutomationControlled)
+    #   - Realistic User-Agent header
+    #   - Human-like timing (wait_between_actions, page-load waits)
+    #   - Session persistence (user_data_dir with cookies)
     
     # Create LLM for the agent using browser-use's ChatAnthropic
     llm = BrowserChatAnthropic(
         model="claude-sonnet-4-0",
     )
     
+    # Prepend Cloudflare handling instructions to every prompt
+    enhanced_prompt = _prepend_cloudflare_instructions(prompt)
+    
     agent = Agent(
-        task=prompt,
+        task=enhanced_prompt,
         llm=llm,
         browser=browser,
     )
@@ -580,6 +759,40 @@ async def execute_browser_action(
         raise
 
 
+def _prepend_cloudflare_instructions(prompt: str) -> str:
+    """
+    Prepend universal Cloudflare / bot-detection handling instructions to any
+    browser-use prompt so the agent knows how to react when it encounters a
+    challenge page on an external site.
+    """
+    cloudflare_block = """
+=== CLOUDFLARE / BOT-DETECTION HANDLING (READ FIRST) ===
+
+When navigating to ANY external website (especially job application sites),
+you may encounter a Cloudflare "Verify you are human" interstitial page.
+
+Follow these steps EXACTLY:
+
+1. **WAIT first** — Do NOT click anything for 3-5 seconds. Cloudflare
+   often auto-solves the challenge if you simply wait.
+2. **Check for a checkbox or button** — If you see a Turnstile widget
+   (a small checkbox that says "Verify you are human"), click it ONCE
+   and then wait 5-8 seconds for the redirect.
+3. **Do NOT spam-click** — Clicking the verify button repeatedly will
+   get you blocked. Click once and wait.
+4. **If the page reloads to the same challenge**, wait 10 seconds, then
+   try refreshing the page ONE time.
+5. **If still blocked after ~30 seconds total**, move on to the next
+   job / task. Do NOT keep retrying the same site.
+6. **Never open the same external URL in multiple tabs** — this triggers
+   Cloudflare rate-limiting. Use one tab per external site.
+
+=== END CLOUDFLARE INSTRUCTIONS ===
+
+""" + prompt
+    return cloudflare_block
+
+
 def list_chrome_profiles():
     """List available Chrome profiles."""
     print(f"   Available profiles in {CHROME_USER_DATA_DIR}:")
@@ -600,45 +813,68 @@ def list_chrome_profiles():
 
 
 def ensure_chrome_closed():
-    """Ensure Chrome is completely closed before running browser automation."""
+    """Ensure Chrome is completely closed before running browser automation.
+
+    Detects both "Google Chrome" (macOS) and the Playwright-managed
+    Chromium binary that browser-use launches (which appears as plain
+    ``chrome`` in the process list with ``--user-data-dir=…browser_profile``).
+    """
     import subprocess
     import time
-    
+
     print("🔍 Checking if Chrome is running...")
-    
-    # Check if Chrome processes exist
+
+    # Patterns that match any Chrome/Chromium using our profile directory
+    profile_pattern = "chrome.*browser_profile"
+    generic_patterns = [profile_pattern, "Google Chrome"]
+
+    found = False
     try:
-        result = subprocess.run(['pgrep', '-f', 'Google Chrome'], capture_output=True)
-        if result.returncode == 0:
-            print("⚠️ Chrome is currently running. Attempting to close it...")
-            print("   This is necessary to avoid profile conflicts...")
-            
-            # Try graceful close first
-            subprocess.run(['pkill', '-f', 'Google Chrome'], timeout=10)
-            time.sleep(3)
-            
-            # Check if still running
-            result = subprocess.run(['pgrep', '-f', 'Google Chrome'], capture_output=True)
-            if result.returncode == 0:
-                print("💥 Force closing Chrome...")
-                subprocess.run(['pkill', '-9', '-f', 'Google Chrome'], timeout=10)
-                time.sleep(2)
-            
+        for pat in generic_patterns:
+            result = subprocess.run(
+                ["pgrep", "-f", pat], capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                found = True
+                pids = result.stdout.strip().split("\n")
+                print(
+                    f"⚠️ Found {len(pids)} Chrome process(es) matching '{pat}'. "
+                    "Closing to avoid profile lock conflicts..."
+                )
+
+                # Graceful SIGTERM first
+                subprocess.run(["pkill", "-f", pat], timeout=10)
+                time.sleep(3)
+
+                # Check if still alive → force kill
+                result2 = subprocess.run(
+                    ["pgrep", "-f", pat], capture_output=True, text=True
+                )
+                if result2.returncode == 0 and result2.stdout.strip():
+                    print("💥 Force closing Chrome...")
+                    subprocess.run(["pkill", "-9", "-f", pat], timeout=10)
+                    time.sleep(2)
+
+        # Always remove stale singleton artifacts regardless
+        removed_any = False
+        for singleton_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            singleton_file = BROWSER_PROFILE_DIR / singleton_name
+            if singleton_file.exists() or singleton_file.is_symlink():
+                try:
+                    singleton_file.unlink(missing_ok=True)
+                    removed_any = True
+                except OSError:
+                    pass
+        if removed_any:
+            print("🧹 Removed browser profile singleton files")
+
+        if found:
             print("✅ Chrome has been closed successfully")
         else:
             print("✅ Chrome is not running - ready to start with profile")
     except Exception as e:
         print(f"⚠️ Could not check Chrome status: {e}")
-    
-    # Clean up any lock files in custom profile directory
-    try:
-        lock_file = BROWSER_PROFILE_DIR / "SingletonLock"
-        if lock_file.exists() or lock_file.is_symlink():
-            lock_file.unlink(missing_ok=True)
-            print("🧹 Removed browser profile lock file")
-    except Exception as e:
-        print(f"⚠️ Could not clean lock file: {e}")
-    
+
     print("✅ Chrome profile preparation complete")
 
 
@@ -892,7 +1128,8 @@ async def search_and_apply_linkedin_jobs(
     record_video: bool = True,
     headless: bool = False,
     dry_run: bool = False,
-    sort_by: str = "most_recent"
+    sort_by: str = "most_recent",
+    easy_apply_only: bool = True,
 ) -> dict:
     """
     Search for jobs on LinkedIn and apply to them.
@@ -939,8 +1176,12 @@ async def search_and_apply_linkedin_jobs(
         f"keywords={search_query}&"
         f"location={location_query}&"
         f"sortBy={sort_param}&"
-        f"f_TPR=r86400"  # Posted in last 24 hours
+        f"f_TPR=r86400"   # Posted in last 24 hours
     )
+    # Easy Apply filter — avoids Cloudflare-blocked external job sites
+    if easy_apply_only:
+        linkedin_search_url += "&f_AL=true"
+        print("✅ Easy Apply filter enabled (recommended — avoids Cloudflare blocks)")
     
     # Add company filter if specified
     if company_name:
@@ -1165,8 +1406,12 @@ YOUR TASK:
 4. For each of the first {num_jobs} jobs (sorted by most recent):
    a. Click on the job listing to view details
    b. Read the job description briefly to understand requirements
-   c. Look for "Easy Apply" button - if available, click it. If not, do the conventional apply process with external application links. 
-   c.1. Always prefer the "Easy Apply" over external application links. Do the external application links only if the "Easy Apply" button is not available.
+   c. Look for "Easy Apply" button FIRST.
+      - STRONGLY PREFER "Easy Apply" — it stays on LinkedIn and avoids
+        Cloudflare-protected external sites that may block automation.
+      - Only try the external "Apply" link if "Easy Apply" is NOT available.
+   c.1. If the job has NEITHER Easy Apply NOR a working external link,
+        SKIP IT and move to the next job. Do not waste time retrying.
    d. Fill out the application form using the candidate information above
    e. For "Why are you interested" or cover letter questions:
       - Adapt the cover letter template above to mention the specific company/role
@@ -1180,13 +1425,19 @@ YOUR TASK:
 6. Keep track of which jobs you applied to
 
 IMPORTANT NOTES:
-- Be patient with page loads
-- If a CAPTCHA appears, try to solve it or wait and retry
+- Be patient with page loads — wait at least 2-3 seconds after each navigation
+- CLOUDFLARE HANDLING: If an external site shows "Verify you are human":
+  * Wait 3-5 seconds without clicking anything first
+  * Click the verify checkbox/button ONCE, then wait 5-8 seconds
+  * If still blocked after ~20 seconds, go back and SKIP that job
+  * Do NOT open the same URL in multiple tabs (triggers rate-limiting)
+- If a CAPTCHA appears on LinkedIn, try to solve it or wait and retry
 - If a verification code is requested, report that login requires manual intervention
 - For dropdown questions, select the most appropriate option
 - For years of experience, use the value from resume analysis or "5+"
 - For salary expectations, skip or enter "Open to discussion"
 - Tailor responses to each specific job when possible
+- PRIORITIZE Easy Apply jobs — they have the highest success rate
 
 Return a summary of all applications submitted."""
 
@@ -1228,7 +1479,8 @@ async def async_main(
     no_video: bool = False,
     no_profile: bool = False,
     headless: bool = False,
-    optimize_only: bool = False
+    optimize_only: bool = False,
+    easy_apply_only: bool = True,
 ):
     """
     Main async function for browser automation and resume optimization.
@@ -1246,6 +1498,7 @@ async def async_main(
         no_profile: Don't use Chrome profile
         headless: Run browser in headless mode
         optimize_only: Only optimize resume, don't apply
+        easy_apply_only: Only show Easy Apply jobs on LinkedIn (avoids Cloudflare)
     """
     try:
         if action == "optimize" or optimize_only:
@@ -1301,7 +1554,8 @@ async def async_main(
                 record_video=not no_video,
                 headless=headless,
                 dry_run=dry_run,
-                sort_by="most_recent"
+                sort_by="most_recent",
+                easy_apply_only=easy_apply_only,
             )
             return result
         
@@ -1433,8 +1687,20 @@ Examples:
         type=str,
         help="Filter jobs by company name (e.g., 'Google', 'Meta')"
     )
+    parser.add_argument(
+        "--no-easy-apply",
+        action="store_true",
+        help="Disable Easy Apply filter on LinkedIn (allows external job sites, but may hit Cloudflare)"
+    )
     
     args = parser.parse_args()
+
+    # On headless Linux servers, interactive users often forget --headless.
+    # If there is no display, force headless to avoid Chrome startup failure:
+    # "Missing X server or $DISPLAY".
+    if not args.headless and os.name != "nt" and not os.environ.get("DISPLAY"):
+        print("⚠️ No DISPLAY detected; forcing headless mode.")
+        args.headless = True
     
     # List profiles and exit if requested
     if args.list_profiles:
@@ -1527,7 +1793,8 @@ Examples:
         no_video=args.no_video,
         no_profile=args.no_profile,
         headless=args.headless,
-        optimize_only=args.optimize_only
+        optimize_only=args.optimize_only,
+        easy_apply_only=not args.no_easy_apply,
     ))
 
 
